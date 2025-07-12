@@ -1,0 +1,786 @@
+#!/bin/bash
+
+# ================================================================
+# SCRIPT CORPORATIVO DE HARDENING PARA UBUNTU SERVER - VERSÃO 12.0
+# Recursos:
+# - Hardening completo do sistema
+# - Integração com AD/LDAP
+# - Log centralizado
+# - Configuração adaptável por perfil
+# Autor: Santo Nascimento | Revisado por Engenharia de Segurança
+# Licença: MIT
+# ================================================================
+
+# ========== CONFIGURAÇÕES GLOBAIS ==========
+export DEBIAN_FRONTEND=noninteractive
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+LOG_FILE="/var/log/secure_hardening_$(date +%Y%m%d_%H%M%S).log"
+BACKUP_DIR="/etc/security_backup_$(date +%Y%m%d_%H%M%S)"
+COMPANY_NAME="Sua Empresa"
+ADMIN_EMAIL="security@${COMPANY_NAME,,}.com"
+FQDN=$(hostname -f)
+HOSTNAME=$(hostname)
+SERVER_ROLE="${1:-STANDARD}"
+
+# Variáveis de autenticação
+AUTH_METHOD="local"
+AD_DOMAIN=""
+AD_ADMIN=""
+LDAP_URI=""
+LDAP_BASE_DN=""
+LOG_SERVER=""
+
+# Parâmetros de kernel seguros
+SECURE_KERNEL_PARAMS=(
+    "kernel.randomize_va_space=2"
+    "net.ipv4.conf.all.rp_filter=1"
+    "net.ipv4.conf.default.rp_filter=1"
+    "net.ipv4.icmp_echo_ignore_broadcasts=1"
+    "net.ipv4.icmp_ignore_bogus_error_responses=1"
+    "net.ipv4.tcp_syncookies=1"
+    "net.ipv4.conf.all.accept_redirects=0"
+    "net.ipv4.conf.default.accept_redirects=0"
+    "net.ipv6.conf.all.accept_redirects=0"
+    "net.ipv6.conf.default.accept_redirects=0"
+    "net.ipv4.tcp_timestamps=0"
+    "net.ipv6.conf.all.accept_ra=0"
+    "net.ipv6.conf.default.accept_ra=0"
+)
+
+# ========== FUNÇÕES UTILITÁRIAS ==========
+log() {
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+check_error() {
+    if [ $? -ne 0 ]; then
+        log "${RED}[ERRO] $1${NC}"
+        [ "$2" == "critical" ] && exit 1
+    fi
+}
+
+verify_environment() {
+    # Verificar root
+    [ "$(id -u)" -ne 0 ] && { log "${RED}Execute como root${NC}"; exit 1; }
+
+    # Verificar Ubuntu
+    grep -qi 'ubuntu' /etc/os-release || { log "${RED}Somente para Ubuntu${NC}"; exit 1; }
+
+    # Criar diretórios de backup e log
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+}
+
+# ========== 1. CONFIGURAÇÃO DE AUTENTICAÇÃO ==========
+configure_auth() {
+    log "${GREEN}[1/12] Configurando autenticação${NC}"
+    
+    echo -e "\n${CYAN}=== MÉTODO DE AUTENTICAÇÃO ===${NC}"
+    echo "1) Autenticação Local (padrão)"
+    echo "2) Microsoft Active Directory"
+    echo "3) OpenLDAP"
+    echo -n "Selecione [1-3]: "
+    read -r auth_choice
+
+    case $auth_choice in
+        2)
+            AUTH_METHOD="active_directory"
+            log "${BLUE}Configurando integração com Active Directory${NC}"
+            
+            echo -n "Domínio do AD (ex: DOMINIO.LOCAL): "
+            read -r AD_DOMAIN
+            echo -n "Usuário admin do AD: "
+            read -r AD_ADMIN
+            
+            # Instalar dependências
+            apt install -y realmd sssd sssd-tools samba-common krb5-user packagekit adcli >> "$LOG_FILE" 2>&1
+            
+            # Configurar Kerberos
+            cat > /etc/krb5.conf <<EOF
+[libdefaults]
+    default_realm = ${AD_DOMAIN^^}
+    dns_lookup_realm = true
+    dns_lookup_kdc = true
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+    rdns = false
+
+[realms]
+    ${AD_DOMAIN^^} = {
+        kdc = ${AD_DOMAIN,,}
+        admin_server = ${AD_DOMAIN,,}
+    }
+
+[domain_realm]
+    .${AD_DOMAIN,,} = ${AD_DOMAIN^^}
+    ${AD_DOMAIN,,} = ${AD_DOMAIN^^}
+EOF
+            
+            # Ingressar no domínio
+            echo -n "Senha do admin do AD: "
+            read -rs AD_PASS
+            echo
+            
+            echo "$AD_PASS" | realm join -U "$AD_ADMIN" "$AD_DOMAIN" >> "$LOG_FILE" 2>&1
+            check_error "Falha ao ingressar no domínio AD" "critical"
+            
+            # Configurar SSSD
+            sed -i 's/use_fully_qualified_names = .*/use_fully_qualified_names = False/' /etc/sssd/sssd.conf
+            systemctl restart sssd
+            
+            log "${GREEN}Integração com AD configurada com sucesso${NC}"
+            ;;
+        3)
+            AUTH_METHOD="ldap"
+            log "${BLUE}Configurando integração LDAP${NC}"
+            
+            echo -n "URI do servidor LDAP (ex: ldaps://ldap.dominio.com): "
+            read -r LDAP_URI
+            echo -n "BASE DN (ex: dc=dominio,dc=com): "
+            read -r LDAP_BASE_DN
+            
+            # Instalar pacotes
+            apt install -y libnss-ldap libpam-ldap ldap-utils libpam-sss libsss-sudo >> "$LOG_FILE" 2>&1
+            
+            # Configurar LDAP
+            cat > /etc/ldap/ldap.conf <<EOF
+BASE $LDAP_BASE_DN
+URI $LDAP_URI
+TLS_CACERT /etc/ssl/certs/ca-certificates.crt
+EOF
+            
+            # Configurar NSS
+            sed -i 's/^passwd:.*/passwd:         files ldap/' /etc/nsswitch.conf
+            sed -i 's/^group:.*/group:          files ldap/' /etc/nsswitch.conf
+            sed -i 's/^shadow:.*/shadow:         files ldap/' /etc/nsswitch.conf
+            
+            log "${GREEN}Integração LDAP configurada com sucesso${NC}"
+            ;;
+        *)
+            AUTH_METHOD="local"
+            log "${BLUE}Usando autenticação local${NC}"
+            ;;
+    esac
+    
+    # Configurações comuns de PAM
+    configure_pam
+}
+
+configure_pam() {
+    log "${BLUE}Configurando PAM para $AUTH_METHOD${NC}"
+    
+    # Backup do PAM
+    cp /etc/pam.d/common-* "$BACKUP_DIR/" 2>/dev/null
+    
+    case $AUTH_METHOD in
+        active_directory)
+            cat > /etc/pam.d/common-session <<EOF
+session required pam_mkhomedir.so skel=/etc/skel/ umask=0077
+session required pam_unix.so 
+session optional pam_sss.so 
+session optional pam_systemd.so 
+EOF
+            ;;
+        ldap)
+            cat > /etc/pam.d/common-auth <<EOF
+auth    [success=2 default=ignore]  pam_ldap.so
+auth    [success=1 default=ignore]  pam_unix.so nullok_secure try_first_pass
+auth    requisite           pam_deny.so
+auth    required            pam_permit.so
+EOF
+            
+            cat > /etc/pam.d/common-session <<EOF
+session required pam_mkhomedir.so skel=/etc/skel umask=0077
+session required pam_unix.so
+session optional pam_ldap.so
+EOF
+            ;;
+        local)
+            # Configuração local será feita no passo de política de senhas
+            ;;
+    esac
+}
+
+# ========== 2. ATUALIZAÇÃO DO SISTEMA ==========
+system_update() {
+    log "${GREEN}[2/12] Atualizando sistema${NC}"
+    
+    # Configurar fontes seguras
+    sed -i 's/^deb http/deb https/' /etc/apt/sources.list
+    
+    # Atualizar pacotes
+    apt update -q >> "$LOG_FILE" 2>&1
+    apt upgrade -y -q >> "$LOG_FILE" 2>&1
+    apt dist-upgrade -y -q >> "$LOG_FILE" 2>&1
+    
+    # Instalar pacotes essenciais
+    packages=(
+        ufw fail2ban iptables-persistent libpam-pwquality libpam-tmpdir
+        unattended-upgrades needrestart debsums apt-show-versions
+        rkhunter chkrootkit clamav clamav-daemon openssh-server
+        auditd sysstat acct apt-transport-https gnupg2
+        software-properties-common libpam-apparmor apparmor-profiles
+    )
+    
+    for pkg in "${packages[@]}"; do
+        if ! dpkg -s "$pkg" &> /dev/null; then
+            apt install -y -q "$pkg" >> "$LOG_FILE" 2>&1
+            check_error "Falha ao instalar $pkg"
+        fi
+    done
+    
+    apt autoremove -y -q >> "$LOG_FILE" 2>&1
+    apt clean -q >> "$LOG_FILE" 2>&1
+}
+
+# ========== 3. HARDENING DE KERNEL ==========
+kernel_hardening() {
+    log "${GREEN}[3/12] Aplicando hardening de kernel${NC}"
+    
+    # Backup do sysctl
+    cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.original"
+    
+    # Aplicar parâmetros
+    for param in "${SECURE_KERNEL_PARAMS[@]}"; do
+        key=$(echo "$param" | cut -d'=' -f1)
+        value=$(echo "$param" | cut -d'=' -f2)
+        
+        if ! grep -q "^$key" /etc/sysctl.conf; then
+            echo "$key = $value" >> /etc/sysctl.conf
+        else
+            sed -i "s/^$key.*/$key = $value/" /etc/sysctl.conf
+        fi
+    done
+    
+    # Desabilitar módulos perigosos
+    local dangerous_modules=(
+        "dccp" "sctp" "rds" "tipc" "n-hdlc" "ax25" "netrom" "x25"
+        "rose" "decnet" "econet" "af_802154" "ipx" "appletalk" "psnap"
+        "p8023" "p8022" "can" "atm"
+    )
+    
+    for module in "${dangerous_modules[@]}"; do
+        if lsmod | grep -q "$module"; then
+            log "${YELLOW}Descarregando módulo $module${NC}"
+            modprobe -r "$module" >> "$LOG_FILE" 2>&1
+            echo "install $module /bin/true" > "/etc/modprobe.d/$module.conf"
+        fi
+    done
+    
+    # Aplicar configurações
+    sysctl -p >> "$LOG_FILE" 2>&1
+}
+
+# ========== 4. CONFIGURAÇÃO DE FIREWALL ==========
+configure_firewall() {
+    log "${GREEN}[4/12] Configurando firewall${NC}"
+    
+    # Resetar UFW
+    ufw --force disable >/dev/null
+    ufw reset --force >/dev/null
+    
+    # Políticas padrão
+    ufw default deny incoming
+    ufw default allow outgoing
+    
+    # Regras por perfil
+    declare -A RULES=()
+    case "$SERVER_ROLE" in
+        WEB)
+            RULES=(
+                ["SSH"]="22/tcp"
+                ["HTTP"]="80/tcp"
+                ["HTTPS"]="443/tcp"
+                ["DNS"]="53/udp"
+            )
+            ;;
+        DB)
+            RULES=(
+                ["SSH"]="22/tcp"
+                ["MySQL"]="3306/tcp"
+                ["PostgreSQL"]="5432/tcp"
+                ["Redis"]="6379/tcp"
+            )
+            ;;
+        MAIL)
+            RULES=(
+                ["SSH"]="22/tcp"
+                ["SMTP"]="25/tcp"
+                ["SMTPS"]="465/tcp"
+                ["Submission"]="587/tcp"
+                ["IMAP"]="143/tcp"
+                ["IMAPS"]="993/tcp"
+                ["POP3"]="110/tcp"
+                ["POP3S"]="995/tcp"
+            )
+            ;;
+        *)
+            RULES=(
+                ["SSH"]="22/tcp"
+            )
+            ;;
+    esac
+    
+    # Aplicar regras
+    for service in "${!RULES[@]}"; do
+        ufw allow "${RULES[$service]}" comment "$service"
+        log "${BLUE}Liberado: $service (${RULES[$service]})${NC}"
+    done
+    
+    # Ativar firewall
+    ufw logging medium
+    ufw --force enable
+    ufw status verbose >> "$LOG_FILE"
+}
+
+# ========== 5. HARDENING SSH ==========
+harden_ssh() {
+    log "${GREEN}[5/12] Aplicando hardening SSH${NC}"
+    
+    # Backup do config
+    cp /etc/ssh/sshd_config "$BACKUP_DIR/sshd_config.original"
+    
+    # Configurações de segurança
+    local ssh_settings=(
+        "PermitRootLogin no"
+        "PasswordAuthentication no"
+        "ChallengeResponseAuthentication no"
+        "X11Forwarding no"
+        "ClientAliveInterval 300"
+        "ClientAliveCountMax 2"
+        "MaxAuthTries 3"
+        "LoginGraceTime 60"
+        "AllowAgentForwarding no"
+        "AllowTcpForwarding no"
+        "PermitTunnel no"
+        "UsePAM yes"
+        "TCPKeepAlive no"
+        "Compression no"
+        "LogLevel VERBOSE"
+    )
+    
+    for setting in "${ssh_settings[@]}"; do
+        key=$(echo "$setting" | awk '{print $1}')
+        value=$(echo "$setting" | awk '{print $2}')
+        sed -i "s/^#*$key.*/$key $value/" /etc/ssh/sshd_config
+    done
+    
+    # Configurações de criptografia
+    cat <<EOF >> /etc/ssh/sshd_config
+# Cifras modernas
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256,rsa-sha2-512
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+EOF
+    
+    # Reiniciar SSH
+    systemctl restart sshd
+    check_error "Falha ao reiniciar SSH" "critical"
+}
+
+# ========== 6. POLÍTICA DE SENHAS ==========
+configure_password_policy() {
+    log "${GREEN}[6/12] Configurando política de senhas${NC}"
+    
+    # Backup dos arquivos
+    cp /etc/pam.d/common-password "$BACKUP_DIR/common-password.original"
+    cp /etc/login.defs "$BACKUP_DIR/login.defs.original"
+    
+    # Configurar PAM
+    cat > /etc/pam.d/common-password <<EOF
+password requisite pam_pwquality.so retry=3 minlen=12 difok=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 enforce_for_root
+password required pam_pwhistory.so remember=5 use_authtok
+password [success=1 default=ignore] pam_unix.so obscure use_authtok try_first_pass sha512 rounds=65536
+password requisite pam_deny.so
+password required pam_permit.so
+EOF
+    
+    # Configurar login.defs
+    sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS 90/' /etc/login.defs
+    sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS 7/' /etc/login.defs
+    sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE 14/' /etc/login.defs
+    sed -i 's/^UMASK.*/UMASK 027/' /etc/login.defs
+    
+    # Aplicar a usuários
+    for user in $(awk -F: '$3 >= 1000 {print $1}' /etc/passwd); do
+        chage --maxdays 90 --mindays 7 --warndays 14 "$user"
+        chage --inactive 30 "$user"
+    done
+    
+    # Configurar root
+    chage --maxdays 90 --mindays 7 --warndays 14 root
+    chage --inactive 30 root
+    
+    # Permissões de diretórios
+    chmod 750 /home/*
+    chmod 700 /root
+}
+
+# ========== 7. FAIL2BAN ==========
+configure_fail2ban() {
+    log "${GREEN}[7/12] Configurando Fail2Ban${NC}"
+    
+    # Backup do config
+    cp /etc/fail2ban/jail.conf "$BACKUP_DIR/jail.conf.original"
+    
+    # Configuração personalizada
+    cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+bantime = 1h
+findtime = 10m
+maxretry = 3
+destemail = $ADMIN_EMAIL
+sender = fail2ban@$FQDN
+action = %(action_mwl)s
+banaction = ufw
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = %(sshd_log)s
+maxretry = 3
+
+[sshd-ddos]
+enabled = true
+port = ssh
+filter = sshd-ddos
+logpath = %(sshd_log)s
+maxretry = 5
+
+[recidive]
+enabled = true
+bantime = 1w
+findtime = 1d
+logpath = /var/log/fail2ban.log
+EOF
+    
+    # Habilitar e iniciar
+    systemctl restart fail2ban
+    systemctl enable fail2ban
+    check_error "Falha ao configurar Fail2Ban" "critical"
+}
+
+# ========== 8. ATUALIZAÇÕES AUTOMÁTICAS ==========
+configure_autoupdates() {
+    log "${GREEN}[8/12] Configurando atualizações automáticas${NC}"
+    
+    # Configurar unattended-upgrades
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}";
+    "\${distro_id}:\${distro_codename}-security";
+    "\${distro_id}:\${distro_codename}-updates";
+    "\${distro_id}ESM:\${distro_codename}";
+};
+Unattended-Upgrade::Package-Blacklist {
+    // Exemplo: "openssh-server";
+};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "02:00";
+Unattended-Upgrade::Mail "$ADMIN_EMAIL";
+Unattended-Upgrade::MailOnlyOnError "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+EOF
+    
+    # Habilitar atualizações diárias
+    echo 'APT::Periodic::Update-Package-Lists "1";' > /etc/apt/apt.conf.d/20auto-upgrades
+    echo 'APT::Periodic::Unattended-Upgrade "1";' >> /etc/apt/apt.conf.d/20auto-upgrades
+    
+    systemctl restart unattended-upgrades
+    systemctl enable unattended-upgrades
+}
+
+# ========== 9. AUDITORIA E MONITORAMENTO ==========
+configure_auditing() {
+    log "${GREEN}[9/12] Configurando auditoria${NC}"
+    
+    # Configurar auditd
+    cat > /etc/audit/audit.rules <<EOF
+-D
+-b 8192
+-f 2
+
+-w /var/log/auth.log -p wa -k authentication
+-w /etc/passwd -p wa -k useraccount
+-w /etc/shadow -p wa -k useraccount
+-w /etc/group -p wa -k useraccount
+-w /etc/gshadow -p wa -k useraccount
+-w /etc/sudoers -p wa -k privileged
+-w /etc/sudoers.d/ -p wa -k privileged
+-a exit,always -F arch=b64 -S bind -S connect -S accept -S listen -k network_activity
+-a exit,always -F arch=b64 -F euid=0 -F auid>=1000 -F auid!=-1 -S execve -k privileged_command
+-w /etc/ -p wa -k etc_changes
+-w /bin/ -p wa -k bin_changes
+-w /sbin/ -p wa -k sbin_changes
+-w /usr/bin/ -p wa -k usrbin_changes
+-w /usr/sbin/ -p wa -k usrsbin_changes
+-w /lib/ -p wa -k lib_changes
+-w /usr/lib/ -p wa -k usrlib_changes
+-a exit,always -F arch=b64 -S mount -S umount2 -k filesystem_mount
+-w /etc/localtime -p wa -k time_change
+EOF
+    
+    # Configurar logrotate
+    cat > /etc/logrotate.d/audit <<EOF
+/var/log/audit/*.log {
+    weekly
+    missingok
+    notifempty
+    compress
+    delaycompress
+    rotate 12
+    create 0600 root root
+    postrotate
+        /etc/init.d/auditd restart >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    
+    # Configurar monitoramento
+    cat > /etc/cron.daily/security-monitoring <<EOF
+#!/bin/bash
+
+FAILED_LOGINS=\$(grep "Failed password" /var/log/auth.log | wc -l)
+if [ "\$FAILED_LOGINS" -gt 10 ]; then
+    echo -e "Host: $HOSTNAME\nTentativas de login falhas: \$FAILED_LOGINS\n\nÚltimas tentativas:\n\$(grep "Failed password" /var/log/auth.log | tail -n 10)" | mail -s "[ALERTA] Muitas tentativas de login falhas em $HOSTNAME" $ADMIN_EMAIL
+fi
+
+UNEXPECTED_PORTS=\$(ss -tuln | awk '{print \$5}' | grep -Ev ":(22|80|443|53|3306|5432)\$" | wc -l)
+if [ "\$UNEXPECTED_PORTS" -gt 0 ]; then
+    ss -tuln | mail -s "[ALERTA] Portas inesperadas abertas em $HOSTNAME" $ADMIN_EMAIL
+fi
+
+if [ -x "\$(command -v debsums)" ]; then
+    debsums -c 2>&1 | grep -v 'OK$' | mail -s "[ALERTA] Verificação de integridade de pacotes em $HOSTNAME" $ADMIN_EMAIL
+fi
+EOF
+    
+    chmod +x /etc/cron.daily/security-monitoring
+    
+    # Iniciar auditoria
+    systemctl restart auditd
+    systemctl enable auditd
+}
+
+# ========== 10. PROTEÇÃO CONTRA MALWARE ==========
+configure_malware_protection() {
+    log "${GREEN}[10/12] Configurando proteção contra malware${NC}"
+    
+    # Atualizar ClamAV
+    freshclam >> "$LOG_FILE" 2>&1
+    
+    # Configurar varredura diária
+    cat > /etc/cron.daily/clamav-scan <<EOF
+#!/bin/bash
+
+LOG_FILE="/var/log/clamav/scan-\$(date +\%Y-\%m-\%d).log"
+clamscan -r /bin /sbin /usr/bin /usr/sbin /lib /usr/lib /etc /root /home --infected --log=\$LOG_FILE
+
+if [ \$? -eq 1 ]; then
+    mail -s "[ALERTA] Malware detectado em $HOSTNAME" $ADMIN_EMAIL < \$LOG_FILE
+fi
+EOF
+    
+    chmod +x /etc/cron.daily/clamav-scan
+    
+    # Configurar rkhunter
+    rkhunter --update
+    rkhunter --propupd
+    
+    # Configurar verificação semanal
+    cat > /etc/cron.weekly/rkhunter-scan <<EOF
+#!/bin/bash
+
+LOG_FILE="/var/log/rkhunter.log"
+rkhunter --check --sk --report-warnings-only > \$LOG_FILE
+
+if [ \$? -ne 0 ] || grep -q "Warning" \$LOG_FILE; then
+    mail -s "[ALERTA] Rkhunter encontrou problemas em $HOSTNAME" $ADMIN_EMAIL < \$LOG_FILE
+fi
+EOF
+    
+    chmod +x /etc/cron.weekly/rkhunter-scan
+}
+
+# ========== 11. LOG CENTRALIZADO ==========
+configure_central_log() {
+    log "${GREEN}[11/12] Configurando log centralizado${NC}"
+    
+    echo -e "\n${CYAN}=== LOG CENTRALIZADO ===${NC}"
+    echo "Deseja configurar envio de logs para servidor centralizado?"
+    echo "1) Sim (RSyslog/ELK)"
+    echo "2) Não"
+    echo -n "Selecione [1-2]: "
+    read -r log_choice
+    
+    if [ "$log_choice" == "1" ]; then
+        echo -n "IP/FQDN do servidor de logs: "
+        read -r LOG_SERVER
+        
+        # Instalar e configurar RSyslog
+        apt install -y rsyslog >> "$LOG_FILE" 2>&1
+        
+        cat > /etc/rsyslog.d/99-central.conf <<EOF
+*.* @${LOG_SERVER}:514
+\$ActionQueueFileName queue
+\$ActionQueueMaxDiskSpace 1g
+\$ActionQueueSaveOnShutdown on
+\$ActionQueueType LinkedList
+\$ActionResumeRetryCount -1
+EOF
+        
+        # Configurar logrotate
+        cat > /etc/logrotate.d/rsyslog <<EOF
+/var/log/syslog
+{
+    rotate 7
+    daily
+    missingok
+    notifempty
+    delaycompress
+    compress
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}
+EOF
+        
+        systemctl restart rsyslog
+        check_error "Falha ao configurar RSyslog"
+        
+        log "${GREEN}Log centralizado configurado para $LOG_SERVER${NC}"
+    else
+        log "${BLUE}Pulando configuração de log centralizado${NC}"
+    fi
+}
+
+# ========== 12. RELATÓRIO FINAL ==========
+generate_report() {
+    log "${GREEN}[12/12] Gerando relatório final${NC}"
+    
+    REPORT_FILE="/root/security_hardening_report_$(date +%Y%m%d_%H%M%S).txt"
+    
+    # Obter informações de rede
+    NET_INFO=$(ip -br -c a)
+    OPEN_PORTS=$(ss -tuln)
+    
+    # Obter informações de autenticação
+    case $AUTH_METHOD in
+        active_directory)
+            AUTH_INFO="Active Directory (${AD_DOMAIN})"
+            ;;
+        ldap)
+            AUTH_INFO="LDAP (${LDAP_URI})"
+            ;;
+        *)
+            AUTH_INFO="Local"
+            ;;
+    esac
+    
+    cat > "$REPORT_FILE" <<EOM
+=====================================================
+RELATÓRIO DE HARDENING - $(date)
+Servidor: $HOSTNAME ($FQDN)
+Perfil: $SERVER_ROLE
+Autenticação: $AUTH_INFO
+=====================================================
+
+=== INFORMAÇÕES DO SISTEMA ===
+- Kernel: $(uname -r)
+- Uptime: $(uptime -p)
+- Load Average: $(uptime | awk -F'load average: ' '{print $2}')
+- Endereços IP:
+$NET_INFO
+
+=== CONFIGURAÇÕES DE SEGURANÇA ===
+
+1. Firewall (UFW):
+$(ufw status verbose | sed 's/^/   /')
+
+2. Portas Abertas:
+$OPEN_PORTS
+
+3. SSH Hardening:
+   - Porta: $(grep -oP '^Port \K\d+' /etc/ssh/sshd_config || echo 22)
+   - Root Login: $(grep -oP '^PermitRootLogin \K\w+' /etc/ssh/sshd_config)
+   - Autenticação por senha: $(grep -oP '^PasswordAuthentication \K\w+' /etc/ssh/sshd_config)
+
+4. Política de Senhas:
+   - Duração máxima: $(grep -oP '^PASS_MAX_DAYS \K.+' /etc/login.defs) dias
+   - Complexidade: Mínimo 12 caracteres com diversos tipos
+
+5. Fail2Ban:
+$(fail2ban-client status | sed 's/^/   /')
+
+6. Atualizações Automáticas:
+   - Status: $(systemctl is-active unattended-upgrades)
+
+7. Auditoria:
+   - Auditd: $(systemctl is-active auditd)
+   - Regras ativas: $(auditctl -l | wc -l)
+
+8. Proteção contra Malware:
+   - ClamAV: $(systemctl is-active clamav-daemon)
+   - Rkhunter: $(which rkhunter >/dev/null && echo "Instalado" || echo "Não instalado")
+
+9. Log Centralizado: $( [ -n "$LOG_SERVER" ] && echo "Habilitado ($LOG_SERVER)" || echo "Desabilitado" )
+
+=== RECOMENDAÇÕES ===
+1. Realizar backup regular das configurações
+2. Implementar monitoramento contínuo
+3. Realizar testes de penetração periódicos
+4. Revisar políticas de segurança trimestralmente
+
+=== ARQUIVOS IMPORTANTES ===
+- Backup das configurações: $BACKUP_DIR
+- Log completo: $LOG_FILE
+- Configurações de auditoria: /etc/audit/audit.rules
+
+Hardening concluído em: $(date)
+EOM
+    
+    # Proteger o relatório
+    chmod 600 "$REPORT_FILE"
+    
+    log "${GREEN}Relatório gerado em: $REPORT_FILE${NC}"
+    log "${GREEN}Backup das configurações originais em: $BACKUP_DIR${NC}"
+    
+    # Exibir resumo
+    echo -e "\n${YELLOW}=== RESUMO DA EXECUÇÃO ===${NC}"
+    grep -E '\[[0-9]+/[0-9]+\]' "$LOG_FILE" | tail -12
+    echo -e "\n${GREEN}Processo de hardening completo!${NC}"
+    echo -e "${GREEN}Verifique o relatório em: $REPORT_FILE${NC}"
+}
+
+# ========== EXECUÇÃO PRINCIPAL ==========
+main() {
+    clear
+    echo -e "${MAGENTA}=== SCRIPT CORPORATIVO DE HARDENING ===${NC}"
+    echo -e "${MAGENTA}=== $(date) ===${NC}"
+    echo -e "${MAGENTA}=== Servidor: $HOSTNAME ($FQDN) ===${NC}"
+    echo -e "${MAGENTA}=== Perfil: $SERVER_ROLE ===${NC}\n"
+    
+    verify_environment
+    configure_auth
+    system_update
+    kernel_hardening
+    configure_firewall
+    harden_ssh
+    configure_password_policy
+    configure_fail2ban
+    configure_autoupdates
+    configure_auditing
+    configure_malware_protection
+    configure_central_log
+    generate_report
+}
+
+main
